@@ -6,7 +6,6 @@ using System.Numerics;
 using System.Text;
 using System.Xml;
 using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 using NLog;
 
 namespace VRCX
@@ -15,6 +14,12 @@ namespace VRCX
     {
         private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
         private static readonly byte[] pngSignatureBytes = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        private static readonly byte[] jpgSOIBytes = { 0xFF, 0xD8 };
+        private static readonly byte[] jpgAPP0Bytes = { 0xFF, 0xE0 };
+        private static readonly byte[] jpgAPP1Bytes = { 0xFF, 0xE1 };
+        private static readonly byte[] jpgEndOfFile = { 0xFF, 0xD9 };
+        private static readonly byte[] jpgVRCXMarker = { 0x56, 0x52, 0x43, 0x58, 0x00, 0x00 }; // "VRCX\x00\x00"
+        private static readonly byte[] jpgSOF0Bytes = { 0xFF, 0xC0 };
         private static readonly ScreenshotMetadataDatabase cacheDatabase = new ScreenshotMetadataDatabase(Path.Combine(Program.AppDataDirectory, "metadataCache.db"));
         private static readonly Dictionary<string, ScreenshotMetadata> metadataCache = new Dictionary<string, ScreenshotMetadata>();
 
@@ -129,8 +134,11 @@ namespace VRCX
         /// <returns>A JObject containing the metadata or null if no metadata was found.</returns>
         public static ScreenshotMetadata GetScreenshotMetadata(string path, bool includeJSON = false)
         {
-            // Early return if file doesn't exist, or isn't a PNG(Check both extension and file header)
-            if (!File.Exists(path) || !path.EndsWith(".png") || !IsPNGFile(path))
+            // Early return if file doesn't exist, or isn't a PNG or JPG (Check both extension and file header)
+            if (!File.Exists(path) || (!path.EndsWith(".png") && !path.EndsWith(".jpg"))
+                || (path.EndsWith(".png") && !IsPNGFile(path))
+                || (path.EndsWith(".jpg") && !IsJPGFile(path))
+            )
                 return null;
 
             ///if (metadataCache.TryGetValue(path, out var cachedMetadata))
@@ -171,7 +179,7 @@ namespace VRCX
             }
 
             // If not JSON metadata, return early so we're not throwing/catching pointless exceptions
-            if (!metadataString.StartsWith("{"))
+            if (!metadataString.StartsWith('{'))
             {
                 // parse VRC prints
                 var xmlIndex = metadataString.IndexOf("<x:xmpmeta", StringComparison.Ordinal);
@@ -192,7 +200,7 @@ namespace VRCX
                         return ScreenshotMetadata.JustError(path, "Failed to parse VRCPrint metadata.");
                     }
                 }
-                
+
                 logger.ConditionalDebug("Screenshot file '{0}' has unknown non-JSON metadata:\n{1}\n", path, metadataString);
                 return ScreenshotMetadata.JustError(path, "File has unknown non-JSON metadata.");
             }
@@ -214,7 +222,7 @@ namespace VRCX
                 return ScreenshotMetadata.JustError(path, "Failed to parse screenshot metadata JSON. Check logs.");
             }
         }
-        
+
         public static ScreenshotMetadata ParseVRCPrint(string xmlString)
         {
             var doc = new XmlDocument();
@@ -647,6 +655,219 @@ namespace VRCX
             }
 
             return metadata;
+        }
+
+        /// <summary>
+        ///     Determines whether the specified file is a JPG file. 
+        ///     We do this by checking if the first 2 bytes in the file path match the JPG SOI (Start Of Image) marker 
+        ///     and if it ends with the EOI (End Of Image) marker
+        /// </summary>
+        /// <param name="path">The path of the file to check.</param>
+        /// <returns>Returns true if the file is a valid JPG</returns>
+        public static bool IsJPGFile(string path)
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+
+            // The smallest valid jpg file is that size (for a single grey pixel)
+            // https://stackoverflow.com/questions/2253404/what-is-the-smallest-valid-jpeg-file-size-in-bytes
+            if (fs.Length < 119) return false;
+
+            // Read only the first 2 bytes and the last 2 bytes of the file to check if it's a JPG file
+            var signature = new byte[2];
+            fs.Read(signature);
+            if (signature.SequenceEqual(jpgSOIBytes))
+            {
+                fs.Seek(-2, SeekOrigin.End);
+                fs.Read(signature);
+                return signature.SequenceEqual(jpgEndOfFile);
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Writes VRCX data into a JPG file. The data will be store in a custom APP1 segment
+        /// </summary>
+        /// <param name="path">Path of the file</param>
+        /// <param name="metadataString">Data to write</param>
+        /// <returns></returns>
+        public static bool WriteJPGVRCXData(string path, string metadataString)
+        {
+
+            if (!File.Exists(path) || !IsJPGFile(path))
+                return false;
+
+            try
+            {
+                using FileStream stream = new(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read, 512);
+                // Starts with VRCX\x00\x00 to make it recognizable
+                byte[] dataToWrite = [.. jpgVRCXMarker, .. Encoding.BigEndianUnicode.GetBytes(metadataString)];
+                if (dataToWrite.Length + 2 > ushort.MaxValue)
+                {
+                    throw new InvalidOperationException("The data to write in the JPG exceeds the maximum length");
+                }
+
+                // Find where to write the data: After the APP0 if present or right after the start of the file
+                stream.Seek(2, SeekOrigin.Begin);
+                byte[] buffer = new byte[2];
+                stream.Read(buffer);
+                if (buffer.SequenceEqual(jpgAPP0Bytes))
+                {
+                    // APP0 at the start, read length and skip to the end of the segment
+                    stream.Read(buffer);
+                    ushort length = BitConvertToUInt16(buffer);
+                    stream.Seek(length - 2, SeekOrigin.Current);
+                }
+
+                // Store the rest of the file
+                byte[] storedData = new byte[stream.Length - stream.Position];
+                stream.Read(storedData);
+
+                // Write the data
+                stream.Seek(-storedData.Length, SeekOrigin.Current);
+                stream.Write(jpgAPP1Bytes);
+                byte[] lengthBytes = BitConverter.GetBytes((ushort)(dataToWrite.Length + 2));
+                // We need big endian
+                if (BitConverter.IsLittleEndian)
+                {
+                    Array.Reverse(lengthBytes);
+                }
+                stream.Write(lengthBytes);
+                stream.Write(dataToWrite);
+
+                // Write the stored rest of the file
+                stream.Write(storedData);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Reads the custom APP1 segment containing VRCX data of a JPG file if it exists
+        /// </summary>
+        /// <param name="path">Path of the file</param>
+        /// <returns></returns>
+        public static string ReadJPGVRCXData(string path)
+        {
+            if (!File.Exists(path) || !IsJPGFile(path))
+                return null;
+
+            try
+            {
+                using FileStream stream = new(path, FileMode.Open);
+                // Check all APP1 segments in the file and get the first one with VRCX data
+                do
+                {
+                    bool app1Found = SeekToNextPattern(stream, jpgAPP1Bytes);
+                    if (!app1Found)
+                    {
+                        return null;
+                    }
+
+                    // Length of segment
+                    byte[] buffer = new byte[2];
+                    stream.Read(buffer);
+                    ushort dataLength = BitConvertToUInt16(buffer);
+
+                    // Check if VRCX data
+                    buffer = new byte[jpgVRCXMarker.Length];
+                    stream.Read(buffer);
+
+                    if (!buffer.SequenceEqual(jpgVRCXMarker))
+                        continue;
+
+                    // Read data
+                    buffer = new byte[dataLength - 2 - jpgVRCXMarker.Length];
+                    stream.Read(buffer);
+                    return Encoding.BigEndianUnicode.GetString(buffer, 0, buffer.Length);
+                }
+                while (stream.Position < (stream.Length - 2));
+                return null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Reads the resolution from a JPG file, using the SOF1 segment
+        /// </summary>
+        /// <param name="path">Path of the file</param>
+        /// <returns></returns>
+        public static string ReadJPGResolution(string path)
+        {
+            if (!File.Exists(path) || !IsJPGFile(path))
+                return null;
+            try
+            {
+                using FileStream stream = new(path, FileMode.Open);
+                bool sof0Found = SeekToNextPattern(stream, jpgSOF0Bytes);
+                if (!sof0Found)
+                {
+                    return null;
+                }
+
+                byte[] buffer = new byte[2];
+                stream.Seek(2, SeekOrigin.Current); // Length of segment
+                stream.Seek(1, SeekOrigin.Current); // Bits per sample
+                stream.Read(buffer); // Image height
+                ushort imgHeight = BitConvertToUInt16(buffer);
+                stream.Read(buffer); // Image width
+                ushort imgWidth = BitConvertToUInt16(buffer);
+
+                return imgWidth + "x" + imgHeight;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Helper to advance the stream to the (first) position of a given pattern of bytes
+        /// </summary>
+        /// <param name="fs">Stream to seek</param>
+        /// <param name="pattern">Pattern to find</param>
+        /// <returns></returns>
+        private static bool SeekToNextPattern(FileStream fs, byte[] pattern)
+        {
+            byte[] buffer = new byte[pattern.Length];
+            for (int i = 0; i < (fs.Length - pattern.Length); i++)
+            {
+                fs.Read(buffer);
+                if (buffer.SequenceEqual(pattern))
+                {
+                    return true;
+                }
+                // Get back to the next byte after the start of buffer to not miss the pattern
+                fs.Seek(1 - pattern.Length, SeekOrigin.Current);
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Converts bytes to a UInt16 while respecting the endianness of the computer AND reverting any operation on the array
+        /// </summary>
+        /// <param name="data">Data to convert</param>
+        /// <returns></returns>
+        private static ushort BitConvertToUInt16(byte[] data)
+        {
+            if (BitConverter.IsLittleEndian)
+            {
+                // Align endianness of data with endianness of the computer for BitConverter, but re-reverse it after
+                ushort value;
+                Array.Reverse(data);
+                value = BitConverter.ToUInt16(data);
+                Array.Reverse(data);
+                return value;
+            }
+            else
+            {
+                return BitConverter.ToUInt16(data);
+            }
         }
     }
 
