@@ -13,7 +13,7 @@ namespace VRCX
     public partial class AppApi
     {
         private static bool dialogOpen;
-        
+
         /// <summary>
         /// Adds metadata to a PNG screenshot file and optionally renames the file to include the specified world ID.
         /// </summary>
@@ -24,18 +24,34 @@ namespace VRCX
         public string AddScreenshotMetadata(string path, string metadataString, string worldId, bool changeFilename = false)
         {
             var fileName = Path.GetFileNameWithoutExtension(path);
-            if (!File.Exists(path) || !path.EndsWith(".png") || !fileName.StartsWith("VRChat_"))
+
+            if (!File.Exists(path))
                 return string.Empty;
 
-            if (changeFilename)
+            if (path.EndsWith(".png"))
             {
-                var newFileName = $"{fileName}_{worldId}";
-                var newPath = Path.Combine(Path.GetDirectoryName(path), newFileName + Path.GetExtension(path));
-                File.Move(path, newPath);
-                path = newPath;
-            }
+                if (!fileName.StartsWith("VRChat_"))
+                    return string.Empty;
 
-            ScreenshotHelper.WritePNGDescription(path, metadataString);
+                if (changeFilename)
+                {
+                    var newFileName = $"{fileName}_{worldId}";
+                    var newPath = Path.Combine(Path.GetDirectoryName(path), newFileName + Path.GetExtension(path));
+                    File.Move(path, newPath);
+                    path = newPath;
+                }
+
+                ScreenshotHelper.WritePNGDescription(path, metadataString);
+
+            }
+            else if (path.EndsWith(".jpg"))
+            {
+                // Do not mess with the file name for SteamVR screenshots, it will break the screenshot viewer in Steam
+                ScreenshotHelper.WriteJPGVRCXData(path, metadataString);
+            }
+            else
+                return string.Empty;
+
             return path;
         }
 
@@ -52,8 +68,8 @@ namespace VRCX
             {
                 using (var openFileDialog = new OpenFileDialog())
                 {
-                    openFileDialog.DefaultExt = ".png";
-                    openFileDialog.Filter = "PNG Files (*.png)|*.png";
+                    openFileDialog.DefaultExt = "*.png;*.jpg";
+                    openFileDialog.Filter = "All supported files (*.png,*.jpg)|*.png;*.jpg|PNG Files (*.png)|*.png|JPG Files (*.jpg)|*.jpg";
                     openFileDialog.FilterIndex = 1;
                     openFileDialog.RestoreDirectory = true;
 
@@ -89,10 +105,10 @@ namespace VRCX
             var fileName = Path.GetFileNameWithoutExtension(path);
             var metadata = new JObject();
 
-            if (!File.Exists(path) || !path.EndsWith(".png"))
+            if (!File.Exists(path) || (!path.EndsWith(".png") && !path.EndsWith(".jpg")))
                 return null;
 
-            var files = Directory.GetFiles(Path.GetDirectoryName(path), "*.png");
+            string[] files = [.. Directory.GetFiles(Path.GetDirectoryName(path), "*.png"), .. Directory.GetFiles(Path.GetDirectoryName(path), "*.jpg")];
 
             // Add previous/next file paths to metadata so the screenshot viewer carousel can request metadata for next/previous images in directory
             if (carouselCache)
@@ -107,8 +123,14 @@ namespace VRCX
                     metadata.Add("nextFilePath", files[index + 1]);
                 }
             }
-
-            metadata.Add("fileResolution", ScreenshotHelper.ReadPNGResolution(path));
+            if (path.EndsWith(".png"))
+            {
+                metadata.Add("fileResolution", ScreenshotHelper.ReadPNGResolution(path));
+            }
+            else if (path.EndsWith(".jpg"))
+            {
+                metadata.Add("fileResolution", ScreenshotHelper.ReadJPGResolution(path));
+            }
 
             var creationDate = File.GetCreationTime(path);
             metadata.Add("creationDate", creationDate.ToString("yyyy-MM-dd HH:mm:ss"));
@@ -117,7 +139,7 @@ namespace VRCX
             metadata.Add("fileSizeBytes", fileSizeBytes.ToString());
             metadata.Add("fileName", fileName);
             metadata.Add("filePath", path);
-            metadata.Add("fileSize", $"{(fileSizeBytes / 1024f / 1024f).ToString("0.00")} MB");
+            metadata.Add("fileSize", $"{fileSizeBytes / 1024f / 1024f:0.00} MB");
 
             return metadata.ToString(Formatting.Indented);
         }
@@ -131,7 +153,6 @@ namespace VRCX
             if (string.IsNullOrEmpty(path))
                 return null;
 
-
             var metadata = ScreenshotHelper.GetScreenshotMetadata(path);
 
             if (metadata == null)
@@ -143,7 +164,7 @@ namespace VRCX
                 };
 
                 return obj.ToString(Formatting.Indented);
-            };
+            }
 
             if (metadata.Error != null)
             {

@@ -16294,6 +16294,15 @@ speechSynthesis.getVoices();
                 // D.metadata.resolution = `${regex[18]}x${regex[19]}`;
             }
         }
+        else {
+            regex = metadata.fileName.match(/(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_/);
+            if (regex) {
+                // Steam screenshot: 20241211013614_1
+                var date = `${regex[1]}-${regex[2]}-${regex[3]}`;
+                var time = `${regex[4]}:${regex[5]}:${regex[6]}`;
+                D.metadata.dateTime = Date.parse(`${date} ${time}`);
+            }
+        }
         if (metadata.timestamp) {
             D.metadata.dateTime = Date.parse(metadata.timestamp);
         }

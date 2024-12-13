@@ -56,16 +56,16 @@ namespace VRCX
         {
             var result = new List<ScreenshotMetadata>();
 
-            var files = Directory.GetFiles(directory, "*.png", SearchOption.AllDirectories);
+            List<string> files = [];
+            files.AddRange(Directory.GetFiles(directory, "*.png", SearchOption.AllDirectories));
+            files.AddRange(Directory.GetFiles(directory, "*.jpg", SearchOption.AllDirectories));
 
             var addToCache = new List<MetadataCache>();
 
             int amtFromCache = 0;
             foreach (var file in files)
             {
-                ScreenshotMetadata metadata = null;
-
-                if (TryGetCachedMetadata(file, out metadata))
+                if (TryGetCachedMetadata(file, out ScreenshotMetadata metadata))
                 {
                     amtFromCache++;
                 }
@@ -122,20 +122,21 @@ namespace VRCX
             if (addToCache.Count > 0)
                 cacheDatabase.BulkAddMetadataCache(addToCache);
 
-            logger.ConditionalDebug("Found {0}/{1} screenshots matching query '{2}' of type '{3}'. {4}/{5} pulled from cache.", result.Count, files.Length, query, searchType, amtFromCache, files.Length);
+            logger.ConditionalDebug("Found {0}/{1} screenshots matching query '{2}' of type '{3}'. {4}/{5} pulled from cache.", result.Count, files.Count, query, searchType, amtFromCache, files.Count);
 
             return result;
         }
 
         /// <summary>
-        /// Retrieves metadata from a PNG screenshot file and attempts to parse it.
+        /// Retrieves metadata from a PNG or JPG screenshot file and attempts to parse it.
         /// </summary>
-        /// <param name="path">The path to the PNG screenshot file.</param>
+        /// <param name="path">The path to the PNG or JPG screenshot file.</param>
         /// <returns>A JObject containing the metadata or null if no metadata was found.</returns>
         public static ScreenshotMetadata GetScreenshotMetadata(string path, bool includeJSON = false)
         {
             // Early return if file doesn't exist, or isn't a PNG or JPG (Check both extension and file header)
-            if (!File.Exists(path) || (!path.EndsWith(".png") && !path.EndsWith(".jpg"))
+            if (!File.Exists(path)
+                || (!path.EndsWith(".png") && !path.EndsWith(".jpg"))
                 || (path.EndsWith(".png") && !IsPNGFile(path))
                 || (path.EndsWith(".jpg") && !IsJPGFile(path))
             )
@@ -144,17 +145,33 @@ namespace VRCX
             ///if (metadataCache.TryGetValue(path, out var cachedMetadata))
             //    return cachedMetadata;
 
-            string metadataString;
+            string metadataString = null;
 
-            // Get the metadata string from the PNG file
-            try
+            if (path.EndsWith(".png"))
             {
-                metadataString = ReadPNGDescription(path);
+                // Get the metadata string from the PNG file
+                try
+                {
+                    metadataString = ReadPNGDescription(path);
+                }
+                catch (Exception ex)
+                {
+                    logger.Error(ex, "Failed to read PNG description for file '{0}'", path);
+                    return ScreenshotMetadata.JustError(path, "Failed to read PNG description. Check logs.");
+                }
             }
-            catch (Exception ex)
+            else if (path.EndsWith(".jpg"))
             {
-                logger.Error(ex, "Failed to read PNG description for file '{0}'", path);
-                return ScreenshotMetadata.JustError(path, "Failed to read PNG description. Check logs.");
+                // Get the metadata string from the JPG file
+                try
+                {
+                    metadataString = ReadJPGVRCXData(path);
+                }
+                catch (Exception ex)
+                {
+                    logger.Error(ex, "Failed to read JPG VRCX Data for file '{0}'", path);
+                    return ScreenshotMetadata.JustError(path, "Failed to read JPG VRCX Data. Check logs.");
+                }
             }
 
             // If the metadata string is empty for some reason, there's nothing to parse.
